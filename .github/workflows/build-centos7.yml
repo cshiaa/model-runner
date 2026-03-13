@@ -17,15 +17,17 @@ on:
         required: false
         type: string
 
-# 全局权限：仅读取代码，release 上传由具体 job 控制
-permissions:
-  contents: read
-
+# 强制 Actions JS runtime 使用 Node.js 24（兼容 2026-06-02 之后的 runner 默认值）
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GO_VERSION: '1.23'
   BINARY_NAME: docker-model-plugin
   # 插件输出目录（相对于仓库根）
   CLI_DIR: cmd/cli
+
+# 全局权限：仅读取代码，release 上传由具体 job 控制
+permissions:
+  contents: read
 
 jobs:
   # ──────────────────────────────────────────────
@@ -46,10 +48,52 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Install golangci-lint
+      # 确认 CLI_DIR 存在，避免 golangci-lint 因找不到目录退出码 3
+      - name: Verify CLI_DIR exists
+        run: |
+          if [ ! -d "${{ env.CLI_DIR }}" ]; then
+            echo "⚠️  CLI_DIR '${{ env.CLI_DIR }}' not found, scanning for go.mod..."
+            find . -name "go.mod" | head -10
+            echo "Please update env.CLI_DIR in this workflow to match your repo layout."
+            exit 1
+          fi
+          echo "✅  CLI_DIR found: ${{ env.CLI_DIR }}"
+          ls "${{ env.CLI_DIR }}"
+
+      # 确保目标目录有 .golangci.yml；若无则生成一份宽松的默认配置，
+      # 防止 golangci-lint 因缺少配置文件以退出码 3 报错
+      - name: Ensure golangci-lint config exists
+        working-directory: ${{ env.CLI_DIR }}
+        run: |
+          if [ ! -f ".golangci.yml" ] && [ ! -f ".golangci.yaml" ] && \
+             [ ! -f ".golangci.toml" ] && [ ! -f ".golangci.json" ]; then
+            echo "No golangci-lint config found — generating a default one"
+            cat > .golangci.yml << 'EOF'
+          version: "2"
+          linters:
+            default: none
+            enable:
+              - errcheck
+              - gosimple
+              - govet
+              - ineffassign
+              - staticcheck
+              - unused
+          linters-settings:
+            govet:
+              enable-all: false
+          issues:
+            max-issues-per-linter: 0
+            max-same-issues: 0
+          EOF
+          else
+            echo "Found existing golangci-lint config, skipping generation"
+          fi
+
+      - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          version: v1.64.8      # 锁定版本，避免 latest 引入破坏性变更
           args: --timeout=5m
           working-directory: ${{ env.CLI_DIR }}
 
