@@ -1,66 +1,306 @@
-name: Build Binary for CentOS 7
+name: Build model-runner-plugin
 
 on:
-  workflow_dispatch:
   push:
+    branches:
+      - main
+      - 'release/**'
     tags:
-      - 'v*'
+      - 'v*.*.*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Build version (e.g. v1.0.0), defaults to git ref'
+        required: false
+        type: string
 
+# 全局权限：仅读取代码，release 上传由具体 job 控制
 permissions:
-  contents: write
+  contents: read
+
+env:
+  GO_VERSION: '1.23'
+  BINARY_NAME: docker-model-plugin
+  # 插件输出目录（相对于仓库根）
+  CLI_DIR: cmd/cli
 
 jobs:
-  build-binary:
+  # ──────────────────────────────────────────────
+  # 1. 代码检查与单元测试
+  # ──────────────────────────────────────────────
+  lint-and-test:
+    name: Lint & Test
     runs-on: ubuntu-latest
-    container: centos:7
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
-      - name: Set up Go
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go ${{ env.GO_VERSION }}
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: ${{ env.GO_VERSION }}
           cache: true
-          cache-dependency-path: |
-            cmd/cli/go.mod
-            cmd/cli/go.sum
-      
-      - name: Build static binary
-        id: build
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+          working-directory: ${{ env.CLI_DIR }}
+
+      - name: Run unit tests
+        working-directory: ${{ env.CLI_DIR }}
         run: |
-          cd cmd/cli
-          
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          go test ./... -v -race -coverprofile=coverage.out
+          go tool cover -func=coverage.out
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: ${{ env.CLI_DIR }}/coverage.out
+          retention-days: 7
+
+  # ──────────────────────────────────────────────
+  # 2. 跨平台构建矩阵
+  # ──────────────────────────────────────────────
+  build:
+    name: Build / ${{ matrix.os }}-${{ matrix.arch }}
+    needs: lint-and-test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm
+            goarm: '7'
+            runner: ubuntu-latest
+          # macOS
+          - os: darwin
+            arch: amd64
+            runner: macos-latest
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+          # Windows
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+            ext: '.exe'
+          - os: windows
+            arch: arm64
+            runner: windows-latest
+            ext: '.exe'
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # 确定版本号：手动输入 > tag > commit SHA 短串
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             VERSION="${{ github.ref_name }}"
           else
             VERSION="dev-$(git rev-parse --short HEAD)"
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -ldflags="-s -w -X main.Version=${VERSION}" \
-            -o docker-model .
-          
-          file docker-model
-          ldd docker-model || echo "Static binary confirmed"
-          cp docker-model ../..
-      
-      - name: Upload binary artifact
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Build version: ${VERSION}"
+
+      - name: Build binary
+        shell: bash
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.goarm || '' }}
+          CGO_ENABLED: '0'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          LDFLAGS="-s -w \
+            -X main.Version=${VERSION} \
+            -X main.GitCommit=$(git rev-parse --short HEAD) \
+            -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          OUTPUT="${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext || '' }}"
+
+          cd ${{ env.CLI_DIR }}
+          go build \
+            -trimpath \
+            -ldflags "${LDFLAGS}" \
+            -o "../../dist/${OUTPUT}" \
+            .
+
+          echo "Built: dist/${OUTPUT}"
+          ls -lh "../../dist/${OUTPUT}"
+
+      # 对 Linux / macOS 二进制做基本冒烟测试
+      - name: Smoke test (Unix)
+        if: matrix.os != 'windows'
+        run: |
+          BINARY="dist/${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}"
+          chmod +x "${BINARY}"
+          # 如果插件支持 --version / version 子命令，在此验证
+          "${BINARY}" --version 2>/dev/null || "${BINARY}" version 2>/dev/null || true
+
+      - name: Generate checksum
+        shell: bash
+        run: |
+          cd dist
+          FILE="${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext || '' }}"
+          if command -v sha256sum &>/dev/null; then
+            sha256sum "${FILE}" > "${FILE}.sha256"
+          else
+            shasum -a 256 "${FILE}" > "${FILE}.sha256"
+          fi
+          cat "${FILE}.sha256"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: docker-model-centos7
-          path: docker-model
+          name: ${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            dist/${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext || '' }}
+            dist/${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext || '' }}.sha256
           retention-days: 30
-      
+
+  # ──────────────────────────────────────────────
+  # 3. 打包归档（可选：生成 .tar.gz / .zip）
+  # ──────────────────────────────────────────────
+  package:
+    name: Package archives
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: ${{ env.BINARY_NAME }}-*
+          merge-multiple: true
+
+      - name: List downloaded files
+        run: ls -lh dist/
+
+      - name: Create archives
+        run: |
+          cd dist
+          for f in ${{ env.BINARY_NAME }}-linux-* ${{ env.BINARY_NAME }}-darwin-*; do
+            [[ "$f" == *.sha256 ]] && continue
+            [[ -f "$f" ]] || continue
+            chmod +x "$f"
+            tar -czf "${f}.tar.gz" "$f"
+            sha256sum "${f}.tar.gz" >> checksums.txt
+          done
+
+          for f in ${{ env.BINARY_NAME }}-windows-*.exe; do
+            [[ -f "$f" ]] || continue
+            zip "${f%.exe}.zip" "$f"
+            sha256sum "${f%.exe}.zip" >> checksums.txt
+          done
+
+          # 合并所有单文件 sha256
+          cat *.sha256 >> checksums.txt 2>/dev/null || true
+          echo "=== Final checksums.txt ==="
+          cat checksums.txt
+
+      - name: Upload packaged archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-archives
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          retention-days: 30
+
+  # ──────────────────────────────────────────────
+  # 4. 发布 Release（仅 tag 推送时执行）
+  # ──────────────────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 需要写权限才能创建 Release
+
+    steps:
+      - name: Checkout code (for release notes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download packaged archives
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-archives
+          path: release-assets/
+
+      - name: Download raw binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets/
+          pattern: ${{ env.BINARY_NAME }}-*
+          merge-multiple: true
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          TAG="${{ github.ref_name }}"
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+
+          echo "## What's Changed" > release_notes.md
+          if [ -n "${PREV_TAG}" ]; then
+            git log "${PREV_TAG}..${TAG}" \
+              --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" \
+              >> release_notes.md
+          else
+            git log --pretty=format:"- %s ([%h](.../%H))" -20 >> release_notes.md
+          fi
+
+          echo "" >> release_notes.md
+          echo "## Checksums" >> release_notes.md
+          echo '```' >> release_notes.md
+          cat release-assets/checksums.txt >> release_notes.md 2>/dev/null || true
+          echo '```' >> release_notes.md
+
+          cat release_notes.md
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: docker-model
-          generate_release_notes: true
+          tag_name: ${{ github.ref_name }}
+          name: "model-runner-plugin ${{ github.ref_name }}"
+          body_path: release_notes.md
           draft: false
-          make_latest: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.zip
+            release-assets/checksums.txt
