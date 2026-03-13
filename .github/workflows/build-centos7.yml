@@ -1,20 +1,29 @@
 name: Build model-runner-plugin
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 触发条件：与 ci.yml 保持一致（PR / push to main），
-# 额外支持 tag 推送和手动触发（用于正式发布）
+# 触发条件：
+#   - PR / push to main：执行 lint + test（与 ci.yml 一致）
+#   - workflow_dispatch：手动触发完整发布流程（lint → test → build → release）
+#     tag 由 prepare job 自动创建，无需提前手动打 tag
 # ─────────────────────────────────────────────────────────────────────────────
 on:
   pull_request:
     branches: [ main ]
   push:
     branches: [ main ]
-    tags:
-      - 'v*.*.*'
   workflow_dispatch:
     inputs:
-      version:
-        description: "Explicit release tag — overrides auto-detect (e.g., v1.2.3)"
+      bumpType:
+        description: "Version bump type (ignored when releaseTag is provided)"
+        required: false
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: "patch"
+      releaseTag:
+        description: "Explicit release tag — overrides auto-bump (e.g., v1.2.3)"
         required: false
         type: string
 
@@ -24,14 +33,14 @@ env:
   GO_VERSION: '1.26.0'
   BINARY_NAME: docker-model-plugin
 
-# 全局最小权限；release job 单独申请 contents: write
+# 全局最小权限；各 job 按需单独申请
 permissions:
   contents: read
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
   # 1. Lint — 与 ci.yml 完全对齐
-  #    跨三个平台运行 make lint，使用精确 commit hash 固定所有 action 版本
+  #    跨 linux / darwin / windows 三平台运行 make lint
   # ───────────────────────────────────────────────────────────────────────────
   lint:
     name: Lint (${{ matrix.goos }})
@@ -63,7 +72,6 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # 2. Test — 与 ci.yml 完全对齐
-  #    检查 vendor 缺失、go mod tidy、竞态测试、make validate
   # ───────────────────────────────────────────────────────────────────────────
   test:
     name: Test
@@ -93,38 +101,105 @@ jobs:
         run: make validate
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 3. Build — 跨平台构建二进制
-  #    仅在 lint + test 均通过后执行
+  # 3. Prepare — 仅手动触发时执行
+  #    自动计算或使用显式 tag，在仓库创建并推送 tag
+  #    逻辑直接移植自 release.yml prepare job
+  # ───────────────────────────────────────────────────────────────────────────
+  prepare:
+    name: Prepare release tag
+    if: github.event_name == 'workflow_dispatch'
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      version:     ${{ steps.resolve.outputs.version }}
+      previous_tag: ${{ steps.resolve.outputs.previous_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: resolve
+        env:
+          EXPLICIT_TAG: ${{ inputs.releaseTag }}
+          BUMP_TYPE:    ${{ inputs.bumpType || 'patch' }}
+        run: |
+          LATEST_TAG=$(git tag --list 'v*' --sort=-v:refname | head -1)
+          echo "Latest existing tag: ${LATEST_TAG:-<none>}"
+
+          if [ -n "$EXPLICIT_TAG" ]; then
+            if ! echo "$EXPLICIT_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Invalid tag format: '$EXPLICIT_TAG'. Expected: v<MAJOR>.<MINOR>.<PATCH>"
+              exit 1
+            fi
+            RELEASE_TAG="$EXPLICIT_TAG"
+            VERSION="${EXPLICIT_TAG#v}"
+            PREVIOUS_TAG="$LATEST_TAG"
+            echo "Using explicit tag: $RELEASE_TAG"
+          else
+            if [ -z "$LATEST_TAG" ]; then
+              echo "No existing tags — starting at v0.1.0"
+              RELEASE_TAG="v0.1.0"
+              VERSION="0.1.0"
+              PREVIOUS_TAG=""
+            else
+              PREVIOUS_TAG="$LATEST_TAG"
+              VERSION="${LATEST_TAG#v}"
+              MAJOR=$(echo "$VERSION" | cut -d. -f1)
+              MINOR=$(echo "$VERSION" | cut -d. -f2)
+              PATCH=$(echo "$VERSION" | cut -d. -f3)
+              case "$BUMP_TYPE" in
+                major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+                minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+                patch) PATCH=$((PATCH+1)) ;;
+              esac
+              VERSION="${MAJOR}.${MINOR}.${PATCH}"
+              RELEASE_TAG="v${VERSION}"
+              echo "Auto-bumped $BUMP_TYPE: $LATEST_TAG → $RELEASE_TAG"
+            fi
+          fi
+
+          echo "release_tag=$RELEASE_TAG"   >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"           >> "$GITHUB_OUTPUT"
+          echo "previous_tag=${PREVIOUS_TAG:-}" >> "$GITHUB_OUTPUT"
+          echo "🏷️  Release tag:  $RELEASE_TAG"
+          echo "🏷️  Version:      $VERSION"
+          echo "🏷️  Previous tag: ${PREVIOUS_TAG:-<none>}"
+
+      - name: Create and push tag
+        env:
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          GH_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git rev-parse "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "⚠️  Tag $RELEASE_TAG already exists — skipping creation"
+            exit 0
+          fi
+          echo "Creating tag $RELEASE_TAG on $(git rev-parse --short HEAD)"
+          git tag "$RELEASE_TAG"
+          git push origin "$RELEASE_TAG"
+          echo "✅ Tag $RELEASE_TAG created and pushed"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 4. Build — 仅 Linux amd64 / arm64，手动触发时执行
   # ───────────────────────────────────────────────────────────────────────────
   build:
-    name: Build (${{ matrix.goos }}-${{ matrix.goarch }})
-    needs: [lint, test]
+    name: Build (linux-${{ matrix.goarch }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: linux
-            goarch: arm
+          - goarch: amd64
+          - goarch: arm64
+          - goarch: arm
             goarm: '7'
-          # macOS
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
-          # Windows
-          - goos: windows
-            goarch: amd64
-            ext: '.exe'
-          - goos: windows
-            goarch: arm64
-            ext: '.exe'
-
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -137,30 +212,15 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      # 版本号优先级：手动输入 > tag > dev-<short-sha>
-      # 与 release.yml prepare job 的逻辑保持一致
-      - name: Determine version
-        id: version
-        run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VERSION="${{ github.ref_name }}"
-          else
-            VERSION="dev-$(git rev-parse --short HEAD)"
-          fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "🏷️  Build version: ${VERSION}"
-
       - name: Build binary
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm || '' }}
+          GOOS:        linux
+          GOARCH:      ${{ matrix.goarch }}
+          GOARM:       ${{ matrix.goarm || '' }}
           CGO_ENABLED: '0'
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          OUTPUT="${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}"
+          VERSION="${{ needs.prepare.outputs.release_tag }}"
+          OUTPUT="${{ env.BINARY_NAME }}-linux-${{ matrix.goarch }}"
 
           LDFLAGS="-s -w \
             -X main.Version=${VERSION} \
@@ -180,24 +240,25 @@ jobs:
       - name: Generate checksum
         run: |
           cd dist
-          FILE="${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}"
+          FILE="${{ env.BINARY_NAME }}-linux-${{ matrix.goarch }}"
           sha256sum "${FILE}" > "${FILE}.sha256"
           cat "${FILE}.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          name: ${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: ${{ env.BINARY_NAME }}-linux-${{ matrix.goarch }}
           path: |
-            dist/${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}
-            dist/${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}.sha256
+            dist/${{ env.BINARY_NAME }}-linux-${{ matrix.goarch }}
+            dist/${{ env.BINARY_NAME }}-linux-${{ matrix.goarch }}.sha256
           retention-days: 30
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 4. Package — 打包归档并汇总 checksums
+  # 5. Package — 打包 .tar.gz 并汇总 checksums
   # ───────────────────────────────────────────────────────────────────────────
   package:
     name: Package archives
+    if: github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -205,7 +266,7 @@ jobs:
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3
         with:
           path: dist/
-          pattern: ${{ env.BINARY_NAME }}-*
+          pattern: ${{ env.BINARY_NAME }}-linux-*
           merge-multiple: true
 
       - name: List downloaded files
@@ -214,26 +275,14 @@ jobs:
       - name: Create archives
         run: |
           cd dist
-
-          # Linux / macOS → .tar.gz
-          for f in ${{ env.BINARY_NAME }}-linux-* ${{ env.BINARY_NAME }}-darwin-*; do
+          for f in ${{ env.BINARY_NAME }}-linux-*; do
             [[ "$f" == *.sha256 ]] && continue
             [[ -f "$f" ]] || continue
             chmod +x "$f"
             tar -czf "${f}.tar.gz" "$f"
             sha256sum "${f}.tar.gz" >> checksums.txt
           done
-
-          # Windows → .zip
-          for f in ${{ env.BINARY_NAME }}-windows-*.exe; do
-            [[ -f "$f" ]] || continue
-            zip "${f%.exe}.zip" "$f"
-            sha256sum "${f%.exe}.zip" >> checksums.txt
-          done
-
-          # 合并单文件 sha256
           cat *.sha256 >> checksums.txt 2>/dev/null || true
-
           echo "=== checksums.txt ==="
           cat checksums.txt
 
@@ -243,18 +292,17 @@ jobs:
           name: ${{ env.BINARY_NAME }}-archives
           path: |
             dist/*.tar.gz
-            dist/*.zip
             dist/checksums.txt
           retention-days: 30
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 5. Release — 仅 tag 推送时执行，与 release.yml github-release job 对齐
-  #    使用 gh CLI 创建 Release（与 release.yml 保持一致）
+  # 6. Release — tag 已由 prepare job 创建，此处直接发布
+  #    与 release.yml github-release job 对齐，使用 gh CLI
   # ───────────────────────────────────────────────────────────────────────────
   release:
     name: Publish GitHub Release
-    needs: package
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -273,37 +321,33 @@ jobs:
 
       - name: Generate release notes
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG:  ${{ needs.prepare.outputs.release_tag }}
+          PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null || echo "")
-
           echo "## What's Changed" > release-notes.md
-          if [ -n "${PREV_TAG}" ]; then
-            git log "${PREV_TAG}..${RELEASE_TAG}" \
+          if [ -n "${PREVIOUS_TAG}" ]; then
+            git log "${PREVIOUS_TAG}..${RELEASE_TAG}" \
               --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" \
               >> release-notes.md
             echo "" >> release-notes.md
-            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${RELEASE_TAG}" >> release-notes.md
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...${RELEASE_TAG}" >> release-notes.md
           else
             git log --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" -20 >> release-notes.md
             echo "" >> release-notes.md
             echo "**Full Changelog**: https://github.com/${{ github.repository }}/tree/${RELEASE_TAG}" >> release-notes.md
           fi
-
           echo "" >> release-notes.md
           echo "## Checksums" >> release-notes.md
           echo '```' >> release-notes.md
           cat release-assets/checksums.txt >> release-notes.md 2>/dev/null || true
           echo '```' >> release-notes.md
-
           echo "✅ Release notes:"
           cat release-notes.md
 
-      # 与 release.yml 保持一致：使用 gh CLI 而非第三方 action
       - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           PRERELEASE_FLAG=""
           if echo "$RELEASE_TAG" | grep -qE '\-(rc|beta|alpha)'; then
@@ -316,7 +360,6 @@ jobs:
             --notes-file release-notes.md \
             $PRERELEASE_FLAG \
             release-assets/*.tar.gz \
-            release-assets/*.zip \
             release-assets/checksums.txt
 
           echo "✅ Release $RELEASE_TAG published"
