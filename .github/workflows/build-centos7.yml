@@ -2,9 +2,9 @@ name: Build model-runner-plugin
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 触发条件：
-#   - PR / push to main：执行 lint + test（与 ci.yml 一致）
-#   - workflow_dispatch：手动触发完整发布流程（lint → test → build → release）
-#     tag 由 prepare job 自动创建，无需提前手动打 tag
+#   - PR / push to main：仅执行 lint + test（日常 CI）
+#   - workflow_dispatch：手动触发完整发布流程
+#     prepare job 自动创建 tag，无需提前手动打 tag
 # ─────────────────────────────────────────────────────────────────────────────
 on:
   pull_request:
@@ -31,7 +31,6 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GO_VERSION: '1.26.0'
-  BINARY_NAME: docker-model-plugin
 
 # 全局最小权限；各 job 按需单独申请
 permissions:
@@ -39,8 +38,8 @@ permissions:
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
-  # 1. Lint — 与 ci.yml 完全对齐
-  #    跨 linux / darwin / windows 三平台运行 make lint
+  # 1. Lint — PR / push / workflow_dispatch 均执行
+  #    与 ci.yml 完全对齐，跨 linux / darwin / windows 三平台运行 make lint
   # ───────────────────────────────────────────────────────────────────────────
   lint:
     name: Lint (${{ matrix.goos }})
@@ -48,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        goos: [linux, darwin, windows]
+        goos: [linux]
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -71,7 +70,8 @@ jobs:
         run: make lint
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 2. Test — 与 ci.yml 完全对齐
+  # 2. Test — PR / push / workflow_dispatch 均执行
+  #    与 ci.yml 完全对齐
   # ───────────────────────────────────────────────────────────────────────────
   test:
     name: Test
@@ -101,9 +101,9 @@ jobs:
         run: make validate
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 3. Prepare — 仅手动触发时执行
-  #    自动计算或使用显式 tag，在仓库创建并推送 tag
-  #    逻辑直接移植自 release.yml prepare job
+  # 3. Prepare — 仅 workflow_dispatch 触发
+  #    自动计算或使用显式 tag，创建并推送到仓库
+  #    移植自 release.yml prepare job
   # ───────────────────────────────────────────────────────────────────────────
   prepare:
     name: Prepare release tag
@@ -113,8 +113,8 @@ jobs:
     permissions:
       contents: write
     outputs:
-      release_tag: ${{ steps.resolve.outputs.release_tag }}
-      version:     ${{ steps.resolve.outputs.version }}
+      release_tag:  ${{ steps.resolve.outputs.release_tag }}
+      version:      ${{ steps.resolve.outputs.version }}
       previous_tag: ${{ steps.resolve.outputs.previous_tag }}
     steps:
       - name: Checkout code
@@ -163,9 +163,9 @@ jobs:
             fi
           fi
 
-          echo "release_tag=$RELEASE_TAG"   >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION"           >> "$GITHUB_OUTPUT"
-          echo "previous_tag=${PREVIOUS_TAG:-}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG"        >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"                >> "$GITHUB_OUTPUT"
+          echo "previous_tag=${PREVIOUS_TAG:-}"  >> "$GITHUB_OUTPUT"
           echo "🏷️  Release tag:  $RELEASE_TAG"
           echo "🏷️  Version:      $VERSION"
           echo "🏷️  Previous tag: ${PREVIOUS_TAG:-<none>}"
@@ -185,10 +185,16 @@ jobs:
           echo "✅ Tag $RELEASE_TAG created and pushed"
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 4. Build — 仅 Linux amd64 / arm64，手动触发时执行
+  # 4. Build — 仅 workflow_dispatch 触发，lint + test + prepare 通过后执行
+  #
+  #    使用 make 分两步编译：
+  #      a) 服务端（根目录）：make build          → model-runner 守护进程
+  #      b) CLI（cmd/cli）：  make build          → docker-model 插件二进制
+  #
+  #    仅构建 Linux amd64 / arm64 / arm(v7)
   # ───────────────────────────────────────────────────────────────────────────
   build:
-    name: Build (linux-${{ matrix.goarch }})
+    name: Build (linux/${{ matrix.goarch }})
     if: github.event_name == 'workflow_dispatch'
     needs: prepare
     runs-on: ubuntu-latest
@@ -197,9 +203,8 @@ jobs:
       matrix:
         include:
           - goarch: amd64
-          - goarch: arm64
-          - goarch: arm
             goarm: '7'
+
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -212,45 +217,78 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Build binary
+      # ── 4a. 编译服务端（根目录 make build）─────────────────────────────────
+      - name: Build server (model-runner daemon)
         env:
           GOOS:        linux
           GOARCH:      ${{ matrix.goarch }}
-          GOARM:       ${{ matrix.goarm || '' }}
+          GOARM:       ${{ matrix.goarm }}
           CGO_ENABLED: '0'
+          VERSION:     ${{ needs.prepare.outputs.release_tag }}
         run: |
-          VERSION="${{ needs.prepare.outputs.release_tag }}"
-          OUTPUT="${{ env.BINARY_NAME }}-linux-${{ matrix.goarch }}"
+          echo "▶ Building model-runner server for linux/${{ matrix.goarch }}..."
+          make build
+          echo "✅ Server build complete"
+          ls -lh model-runner 2>/dev/null || ls -lh bin/ 2>/dev/null || true
 
-          LDFLAGS="-s -w \
-            -X main.Version=${VERSION} \
-            -X main.GitCommit=$(git rev-parse --short HEAD) \
-            -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      # ── 4b. 编译 CLI（cmd/cli 目录 make build）──────────────────────────────
+      - name: Build CLI (docker-model plugin)
+        env:
+          GOOS:        linux
+          GOARCH:      ${{ matrix.goarch }}
+          GOARM:       ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+          VERSION:     ${{ needs.prepare.outputs.release_tag }}
+        working-directory: cmd/cli
+        run: |
+          echo "▶ Building docker-model CLI for linux/${{ matrix.goarch }}..."
+          make build
+          echo "✅ CLI build complete"
+          ls -lh docker-model 2>/dev/null || ls -lh . 2>/dev/null || true
 
+      # ── 收集产物并生成 checksum ──────────────────────────────────────────────
+      - name: Collect artifacts and generate checksums
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          GOARM:  ${{ matrix.goarm }}
+        run: |
+          SUFFIX="linux-${GOARCH}$( [ -n "$GOARM" ] && echo "v${GOARM}" || true )"
           mkdir -p dist
-          go build \
-            -trimpath \
-            -ldflags "${LDFLAGS}" \
-            -o "dist/${OUTPUT}" \
-            .
 
-          echo "✅ Built: dist/${OUTPUT}"
-          ls -lh "dist/${OUTPUT}"
+          # 服务端：查找 make build 产出的二进制（兼容不同 Makefile 输出路径）
+          SERVER_BIN=$(find . -maxdepth 3 \
+            \( -path ./dist -o -path ./cmd \) -prune -o \
+            -type f -name 'model-runner' -print | head -1)
+          if [ -n "$SERVER_BIN" ]; then
+            cp "$SERVER_BIN" "dist/model-runner-${SUFFIX}"
+            echo "Collected server: dist/model-runner-${SUFFIX}"
+          else
+            echo "::warning::model-runner binary not found, check Makefile output path"
+          fi
 
-      - name: Generate checksum
-        run: |
+          # CLI：查找 cmd/cli 下 make build 产出的二进制
+          CLI_BIN=$(find cmd/cli -maxdepth 2 \
+            -type f \( -name 'docker-model' -o -name 'model-cli' \) | head -1)
+          if [ -n "$CLI_BIN" ]; then
+            cp "$CLI_BIN" "dist/docker-model-${SUFFIX}"
+            echo "Collected CLI: dist/docker-model-${SUFFIX}"
+          else
+            echo "::warning::docker-model binary not found, check cmd/cli Makefile output path"
+          fi
+
+          # 生成 sha256 checksum
           cd dist
-          FILE="${{ env.BINARY_NAME }}-linux-${{ matrix.goarch }}"
-          sha256sum "${FILE}" > "${FILE}.sha256"
-          cat "${FILE}.sha256"
+          for f in *; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" > "${f}.sha256"
+            echo "  $(cat ${f}.sha256)"
+          done
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          name: ${{ env.BINARY_NAME }}-linux-${{ matrix.goarch }}
-          path: |
-            dist/${{ env.BINARY_NAME }}-linux-${{ matrix.goarch }}
-            dist/${{ env.BINARY_NAME }}-linux-${{ matrix.goarch }}.sha256
+          name: binaries-linux-${{ matrix.goarch }}${{ matrix.goarm != '' && format('v{0}', matrix.goarm) || '' }}
+          path: dist/
           retention-days: 30
 
   # ───────────────────────────────────────────────────────────────────────────
@@ -266,22 +304,24 @@ jobs:
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3
         with:
           path: dist/
-          pattern: ${{ env.BINARY_NAME }}-linux-*
+          pattern: binaries-linux-*
           merge-multiple: true
 
       - name: List downloaded files
         run: ls -lh dist/
 
-      - name: Create archives
+      - name: Create tar.gz archives and merge checksums
         run: |
           cd dist
-          for f in ${{ env.BINARY_NAME }}-linux-*; do
+          for f in *; do
             [[ "$f" == *.sha256 ]] && continue
-            [[ -f "$f" ]] || continue
+            [[ "$f" == *.tar.gz ]] && continue
+            [ -f "$f" ] || continue
             chmod +x "$f"
             tar -czf "${f}.tar.gz" "$f"
             sha256sum "${f}.tar.gz" >> checksums.txt
           done
+          # 合并单文件 sha256
           cat *.sha256 >> checksums.txt 2>/dev/null || true
           echo "=== checksums.txt ==="
           cat checksums.txt
@@ -289,14 +329,14 @@ jobs:
       - name: Upload packaged archives
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          name: ${{ env.BINARY_NAME }}-archives
+          name: release-archives
           path: |
             dist/*.tar.gz
             dist/checksums.txt
           retention-days: 30
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 6. Release — tag 已由 prepare job 创建，此处直接发布
+  # 6. Release — tag 已由 prepare job 创建，直接发布
   #    与 release.yml github-release job 对齐，使用 gh CLI
   # ───────────────────────────────────────────────────────────────────────────
   release:
@@ -316,7 +356,7 @@ jobs:
       - name: Download packaged archives
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3
         with:
-          name: ${{ env.BINARY_NAME }}-archives
+          name: release-archives
           path: release-assets/
 
       - name: Generate release notes
