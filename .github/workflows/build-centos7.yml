@@ -1,171 +1,146 @@
 name: Build model-runner-plugin
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 触发条件：与 ci.yml 保持一致（PR / push to main），
+# 额外支持 tag 推送和手动触发（用于正式发布）
+# ─────────────────────────────────────────────────────────────────────────────
 on:
+  pull_request:
+    branches: [ main ]
   push:
-    branches:
-      - main
-      - 'release/**'
+    branches: [ main ]
     tags:
       - 'v*.*.*'
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       version:
-        description: 'Build version (e.g. v1.0.0), defaults to git ref'
+        description: "Explicit release tag — overrides auto-detect (e.g., v1.2.3)"
         required: false
         type: string
 
-# 强制 Actions JS runtime 使用 Node.js 24（兼容 2026-06-02 之后的 runner 默认值）
+# 强制 Actions JS runtime 使用 Node.js 24（2026-06-02 后为默认值）
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  GO_VERSION: '1.23'
+  GO_VERSION: '1.26.0'
   BINARY_NAME: docker-model-plugin
-  # 插件输出目录（相对于仓库根）
-  CLI_DIR: cmd/cli
 
-# 全局权限：仅读取代码，release 上传由具体 job 控制
+# 全局最小权限；release job 单独申请 contents: write
 permissions:
   contents: read
 
 jobs:
-  # ──────────────────────────────────────────────
-  # 1. 代码检查与单元测试
-  # ──────────────────────────────────────────────
-  lint-and-test:
-    name: Lint & Test
+  # ───────────────────────────────────────────────────────────────────────────
+  # 1. Lint — 与 ci.yml 完全对齐
+  #    跨三个平台运行 make lint，使用精确 commit hash 固定所有 action 版本
+  # ───────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (${{ matrix.goos }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin, windows]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
-      - name: Set up Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      # 确认 CLI_DIR 存在，避免 golangci-lint 因找不到目录退出码 3
-      - name: Verify CLI_DIR exists
-        run: |
-          if [ ! -d "${{ env.CLI_DIR }}" ]; then
-            echo "⚠️  CLI_DIR '${{ env.CLI_DIR }}' not found, scanning for go.mod..."
-            find . -name "go.mod" | head -10
-            echo "Please update env.CLI_DIR in this workflow to match your repo layout."
-            exit 1
-          fi
-          echo "✅  CLI_DIR found: ${{ env.CLI_DIR }}"
-          ls "${{ env.CLI_DIR }}"
-
-      # 确保目标目录有 .golangci.yml；若无则生成一份宽松的默认配置，
-      # 防止 golangci-lint 因缺少配置文件以退出码 3 报错
-      - name: Ensure golangci-lint config exists
-        working-directory: ${{ env.CLI_DIR }}
-        run: |
-          if [ ! -f ".golangci.yml" ] && [ ! -f ".golangci.yaml" ] && \
-             [ ! -f ".golangci.toml" ] && [ ! -f ".golangci.json" ]; then
-            echo "No golangci-lint config found — generating a default one"
-            cat > .golangci.yml << 'EOF'
-          version: "2"
-          linters:
-            default: none
-            enable:
-              - errcheck
-              - gosimple
-              - govet
-              - ineffassign
-              - staticcheck
-              - unused
-          linters-settings:
-            govet:
-              enable-all: false
-          issues:
-            max-issues-per-linter: 0
-            max-same-issues: 0
-          EOF
-          else
-            echo "Found existing golangci-lint config, skipping generation"
-          fi
-
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20
         with:
-          version: v1.64.8      # 锁定版本，避免 latest 引入破坏性变更
-          args: --timeout=5m
-          working-directory: ${{ env.CLI_DIR }}
+          version: v2.10.1
+          install-only: true
 
-      - name: Run unit tests
-        working-directory: ${{ env.CLI_DIR }}
-        run: |
-          go test ./... -v -race -coverprofile=coverage.out
-          go tool cover -func=coverage.out
+      - name: Run lint for ${{ matrix.goos }}
+        env:
+          GOOS: ${{ matrix.goos }}
+        run: make lint
 
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+  # ───────────────────────────────────────────────────────────────────────────
+  # 2. Test — 与 ci.yml 完全对齐
+  #    检查 vendor 缺失、go mod tidy、竞态测试、make validate
+  # ───────────────────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Verify vendor/ is not present
+        run: stat vendor && exit 1 || exit 0
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
         with:
-          name: coverage-report
-          path: ${{ env.CLI_DIR }}/coverage.out
-          retention-days: 7
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
 
-  # ──────────────────────────────────────────────
-  # 2. 跨平台构建矩阵
-  # ──────────────────────────────────────────────
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Run tests with race detection
+        run: go test -race ./...
+
+      - name: Validate
+        run: make validate
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 3. Build — 跨平台构建二进制
+  #    仅在 lint + test 均通过后执行
+  # ───────────────────────────────────────────────────────────────────────────
   build:
-    name: Build / ${{ matrix.os }}-${{ matrix.arch }}
-    needs: lint-and-test
+    name: Build (${{ matrix.goos }}-${{ matrix.goarch }})
+    needs: [lint, test]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           # Linux
-          - os: linux
-            arch: amd64
-            runner: ubuntu-latest
-          - os: linux
-            arch: arm64
-            runner: ubuntu-latest
-          - os: linux
-            arch: arm
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
             goarm: '7'
-            runner: ubuntu-latest
           # macOS
-          - os: darwin
-            arch: amd64
-            runner: macos-latest
-          - os: darwin
-            arch: arm64
-            runner: macos-latest
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
           # Windows
-          - os: windows
-            arch: amd64
-            runner: windows-latest
+          - goos: windows
+            goarch: amd64
             ext: '.exe'
-          - os: windows
-            arch: arm64
-            runner: windows-latest
+          - goos: windows
+            goarch: arm64
             ext: '.exe'
-
-    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
 
-      - name: Set up Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      # 确定版本号：手动输入 > tag > commit SHA 短串
+      # 版本号优先级：手动输入 > tag > dev-<short-sha>
+      # 与 release.yml prepare job 的逻辑保持一致
       - name: Determine version
         id: version
-        shell: bash
         run: |
           if [ -n "${{ github.event.inputs.version }}" ]; then
             VERSION="${{ github.event.inputs.version }}"
@@ -175,74 +150,59 @@ jobs:
             VERSION="dev-$(git rev-parse --short HEAD)"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Build version: ${VERSION}"
+          echo "🏷️  Build version: ${VERSION}"
 
       - name: Build binary
-        shell: bash
         env:
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm || '' }}
           CGO_ENABLED: '0'
         run: |
           VERSION="${{ steps.version.outputs.version }}"
+          OUTPUT="${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}"
+
           LDFLAGS="-s -w \
             -X main.Version=${VERSION} \
             -X main.GitCommit=$(git rev-parse --short HEAD) \
             -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          OUTPUT="${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext || '' }}"
-
-          cd ${{ env.CLI_DIR }}
+          mkdir -p dist
           go build \
             -trimpath \
             -ldflags "${LDFLAGS}" \
-            -o "../../dist/${OUTPUT}" \
+            -o "dist/${OUTPUT}" \
             .
 
-          echo "Built: dist/${OUTPUT}"
-          ls -lh "../../dist/${OUTPUT}"
-
-      # 对 Linux / macOS 二进制做基本冒烟测试
-      - name: Smoke test (Unix)
-        if: matrix.os != 'windows'
-        run: |
-          BINARY="dist/${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}"
-          chmod +x "${BINARY}"
-          # 如果插件支持 --version / version 子命令，在此验证
-          "${BINARY}" --version 2>/dev/null || "${BINARY}" version 2>/dev/null || true
+          echo "✅ Built: dist/${OUTPUT}"
+          ls -lh "dist/${OUTPUT}"
 
       - name: Generate checksum
-        shell: bash
         run: |
           cd dist
-          FILE="${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext || '' }}"
-          if command -v sha256sum &>/dev/null; then
-            sha256sum "${FILE}" > "${FILE}.sha256"
-          else
-            shasum -a 256 "${FILE}" > "${FILE}.sha256"
-          fi
+          FILE="${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}"
+          sha256sum "${FILE}" > "${FILE}.sha256"
           cat "${FILE}.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          name: ${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}
+          name: ${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
-            dist/${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext || '' }}
-            dist/${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext || '' }}.sha256
+            dist/${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}
+            dist/${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}.sha256
           retention-days: 30
 
-  # ──────────────────────────────────────────────
-  # 3. 打包归档（可选：生成 .tar.gz / .zip）
-  # ──────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────────────────
+  # 4. Package — 打包归档并汇总 checksums
+  # ───────────────────────────────────────────────────────────────────────────
   package:
     name: Package archives
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - name: Download all build artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3
         with:
           path: dist/
           pattern: ${{ env.BINARY_NAME }}-*
@@ -254,6 +214,8 @@ jobs:
       - name: Create archives
         run: |
           cd dist
+
+          # Linux / macOS → .tar.gz
           for f in ${{ env.BINARY_NAME }}-linux-* ${{ env.BINARY_NAME }}-darwin-*; do
             [[ "$f" == *.sha256 ]] && continue
             [[ -f "$f" ]] || continue
@@ -262,19 +224,21 @@ jobs:
             sha256sum "${f}.tar.gz" >> checksums.txt
           done
 
+          # Windows → .zip
           for f in ${{ env.BINARY_NAME }}-windows-*.exe; do
             [[ -f "$f" ]] || continue
             zip "${f%.exe}.zip" "$f"
             sha256sum "${f%.exe}.zip" >> checksums.txt
           done
 
-          # 合并所有单文件 sha256
+          # 合并单文件 sha256
           cat *.sha256 >> checksums.txt 2>/dev/null || true
-          echo "=== Final checksums.txt ==="
+
+          echo "=== checksums.txt ==="
           cat checksums.txt
 
       - name: Upload packaged archives
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: ${{ env.BINARY_NAME }}-archives
           path: |
@@ -283,68 +247,76 @@ jobs:
             dist/checksums.txt
           retention-days: 30
 
-  # ──────────────────────────────────────────────
-  # 4. 发布 Release（仅 tag 推送时执行）
-  # ──────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────────────────
+  # 5. Release — 仅 tag 推送时执行，与 release.yml github-release job 对齐
+  #    使用 gh CLI 创建 Release（与 release.yml 保持一致）
+  # ───────────────────────────────────────────────────────────────────────────
   release:
     name: Publish GitHub Release
     needs: package
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # 需要写权限才能创建 Release
+      contents: write
 
     steps:
-      - name: Checkout code (for release notes)
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
 
       - name: Download packaged archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3
         with:
           name: ${{ env.BINARY_NAME }}-archives
           path: release-assets/
 
-      - name: Download raw binaries
-        uses: actions/download-artifact@v4
-        with:
-          path: release-assets/
-          pattern: ${{ env.BINARY_NAME }}-*
-          merge-multiple: true
-
       - name: Generate release notes
-        id: release_notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          TAG="${{ github.ref_name }}"
-          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+          PREV_TAG=$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null || echo "")
 
-          echo "## What's Changed" > release_notes.md
+          echo "## What's Changed" > release-notes.md
           if [ -n "${PREV_TAG}" ]; then
-            git log "${PREV_TAG}..${TAG}" \
+            git log "${PREV_TAG}..${RELEASE_TAG}" \
               --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" \
-              >> release_notes.md
+              >> release-notes.md
+            echo "" >> release-notes.md
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${RELEASE_TAG}" >> release-notes.md
           else
-            git log --pretty=format:"- %s ([%h](.../%H))" -20 >> release_notes.md
+            git log --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" -20 >> release-notes.md
+            echo "" >> release-notes.md
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/tree/${RELEASE_TAG}" >> release-notes.md
           fi
 
-          echo "" >> release_notes.md
-          echo "## Checksums" >> release_notes.md
-          echo '```' >> release_notes.md
-          cat release-assets/checksums.txt >> release_notes.md 2>/dev/null || true
-          echo '```' >> release_notes.md
+          echo "" >> release-notes.md
+          echo "## Checksums" >> release-notes.md
+          echo '```' >> release-notes.md
+          cat release-assets/checksums.txt >> release-notes.md 2>/dev/null || true
+          echo '```' >> release-notes.md
 
-          cat release_notes.md
+          echo "✅ Release notes:"
+          cat release-notes.md
 
+      # 与 release.yml 保持一致：使用 gh CLI 而非第三方 action
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: "model-runner-plugin ${{ github.ref_name }}"
-          body_path: release_notes.md
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
-          files: |
-            release-assets/*.tar.gz
-            release-assets/*.zip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          PRERELEASE_FLAG=""
+          if echo "$RELEASE_TAG" | grep -qE '\-(rc|beta|alpha)'; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          gh release create "$RELEASE_TAG" \
+            --repo "${{ github.repository }}" \
+            --title "model-runner-plugin $RELEASE_TAG" \
+            --notes-file release-notes.md \
+            $PRERELEASE_FLAG \
+            release-assets/*.tar.gz \
+            release-assets/*.zip \
             release-assets/checksums.txt
+
+          echo "✅ Release $RELEASE_TAG published"
